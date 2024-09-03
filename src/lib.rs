@@ -2,10 +2,17 @@
 //! The example harness is built for libpng.
 //! This will fuzz javascript.
 
-use clap::Parser;
 use core::time::Duration;
+use std::{
+    env, fs,
+    io::{Read, Write},
+    net::SocketAddr,
+    path::PathBuf,
+};
+
+use clap::Parser;
 use libafl::{
-    corpus::{CachedOnDiskCorpus, Corpus, OnDiskCorpus},
+    corpus::{CachedOnDiskCorpus, OnDiskCorpus},
     events::{EventConfig, Launcher},
     executors::{inprocess::InProcessExecutor, ExitKind},
     feedback_or, feedback_or_fast,
@@ -18,9 +25,10 @@ use libafl::{
     monitors::MultiMonitor,
     mutators::{encoded_mutations::encoded_mutations, StdScheduledMutator},
     observers::{HitcountsMapObserver, StdMapObserver, TimeObserver},
+    prelude::CanTrack,
     schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},
     stages::mutational::StdMutationalStage,
-    state::{HasCorpus, StdState},
+    state::StdState,
     Error, Evaluator,
 };
 use libafl_bolts::{
@@ -30,14 +38,7 @@ use libafl_bolts::{
     shmem::{ShMemProvider, StdShMemProvider},
     tuples::tuple_list,
 };
-use std::{
-    env, fs,
-    io::{Read, Write},
-    net::SocketAddr,
-    path::PathBuf,
-};
-
-use libafl_targets::{libfuzzer_initialize, libfuzzer_test_one_input, EDGES_MAP, MAX_EDGES_NUM};
+use libafl_targets::{edges_max_num, libfuzzer_initialize, libfuzzer_test_one_input, EDGES_MAP};
 
 /// Parses a millseconds int into a [`Duration`], used for commandline arg parsing
 fn timeout_from_millis_str(time: &str) -> Result<Duration, Error> {
@@ -118,7 +119,6 @@ pub fn libafl_main() {
     let context = NautilusContext::from_file(64, "grammar.json");
     let mut tokenizer = NaiveTokenizer::default();
     let mut encoder_decoder = TokenInputEncoderDecoder::new();
-    let mut initial_inputs = vec![];
 
     if let Some(repro) = opt.repro {
         for i in 0..NUM_GENERATED {
@@ -151,22 +151,6 @@ pub fn libafl_main() {
         return;
     }
 
-    let mut generator = NautilusGenerator::new(&context);
-
-    let mut bytes = vec![];
-    for i in 0..NUM_GENERATED {
-        let nautilus = generator.generate(&mut ()).unwrap();
-        nautilus.unparse(&context, &mut bytes);
-
-        let mut file = fs::File::create(initial_dir.join(format!("id_{i}"))).unwrap();
-        file.write_all(&bytes).unwrap();
-
-        let input = encoder_decoder
-            .encode(&bytes, &mut tokenizer)
-            .expect("encoding failed");
-        initial_inputs.push(input);
-    }
-
     println!(
         "Workdir: {:?}",
         env::current_dir().unwrap().to_string_lossy().to_string()
@@ -187,8 +171,9 @@ pub fn libafl_main() {
             HitcountsMapObserver::new(StdMapObserver::from_mut_ptr(
                 "edges",
                 EDGES_MAP.as_mut_ptr(),
-                MAX_EDGES_NUM,
+                edges_max_num(),
             ))
+            .track_indices()
         };
 
         // Create an observation channel to keep track of the execution time
@@ -198,9 +183,9 @@ pub fn libafl_main() {
         // This one is composed by two Feedbacks in OR
         let mut feedback = feedback_or!(
             // New maximization map feedback linked to the edges observer and the feedback state
-            MaxMapFeedback::tracking(&edges_observer, true, false),
+            MaxMapFeedback::new(&edges_observer),
             // Time feedback, this one does not need a feedback state
-            TimeFeedback::with_observer(&time_observer)
+            TimeFeedback::new(&time_observer)
         );
 
         // A feedback to choose if an input is a solution or not
@@ -223,7 +208,28 @@ pub fn libafl_main() {
         });
 
         // A minimization+queue policy to get testcasess from the corpus
-        let scheduler = IndexesLenTimeMinimizerScheduler::new(QueueScheduler::new());
+        let scheduler =
+            IndexesLenTimeMinimizerScheduler::new(&edges_observer, QueueScheduler::new());
+
+        let mut initial_inputs = vec![];
+
+        // In case the corpus is empty (on first run), generate inputs
+        if state.must_load_initial_inputs() {
+            let mut generator = NautilusGenerator::new(&context);
+            let mut bytes = vec![];
+            for i in 0..NUM_GENERATED {
+                let nautilus = generator.generate(&mut state).unwrap();
+                nautilus.unparse(&context, &mut bytes);
+
+                let mut file = fs::File::create(initial_dir.join(format!("id_{i}"))).unwrap();
+                file.write_all(&bytes).unwrap();
+
+                let input = encoder_decoder
+                    .encode(&bytes, &mut tokenizer)
+                    .expect("encoding failed");
+                initial_inputs.push(input);
+            }
+        }
 
         // A fuzzer with feedbacks and a corpus scheduler
         let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
@@ -260,23 +266,20 @@ pub fn libafl_main() {
             println!("Warning: LLVMFuzzerInitialize failed with -1");
         }
 
-        // In case the corpus is empty (on first run), reset
-        if state.corpus().count() < 1 {
-            for input in &initial_inputs {
-                fuzzer
-                    .add_input(
-                        &mut state,
-                        &mut executor,
-                        &mut restarting_mgr,
-                        input.clone(),
-                    )
-                    .unwrap();
-            }
-        }
-
         // Setup a basic mutator with a mutational stage
         let mutator = StdScheduledMutator::with_max_stack_pow(encoded_mutations(), 2);
         let mut stages = tuple_list!(StdMutationalStage::new(mutator));
+
+        for input in &initial_inputs {
+            fuzzer
+                .add_input(
+                    &mut state,
+                    &mut executor,
+                    &mut restarting_mgr,
+                    input.clone(),
+                )
+                .unwrap();
+        }
 
         fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut restarting_mgr)?;
         Ok(())
